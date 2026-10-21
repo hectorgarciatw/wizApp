@@ -8,6 +8,8 @@ struct Lamp: Codable, Identifiable, Hashable {
     var name: String
     var firmware: String?
     var module: String?
+    /// The lamp's own dim-to-warm curve from getUserConfig, as [kelvin, dimming %] pairs.
+    var warmCurve: [[Int]]?
 }
 
 struct RGB: Equatable {
@@ -45,6 +47,9 @@ struct Pilot {
     var dimming = 100
     var temp: Int?
     var rgb: RGB?
+    /// Cool and warm white LEDs mixed into a colour (0…255).
+    var cool = 0
+    var warm = 0
     var sceneId = 0
     var speed: Int?
     var rssi: Int?
@@ -56,6 +61,8 @@ struct Pilot {
         if let r = result["r"] as? Int, let g = result["g"] as? Int, let b = result["b"] as? Int {
             rgb = RGB(r: r, g: g, b: b)
         }
+        cool = result["c"] as? Int ?? 0
+        warm = result["w"] as? Int ?? 0
         sceneId = result["sceneId"] as? Int ?? 0
         speed = result["speed"] as? Int
         rssi = result["rssi"] as? Int
@@ -140,4 +147,21 @@ enum WhiteLight {
     }
 
     static var gradient: [Color] { stops.map { Color(red: $0.r, green: $0.g, blue: $0.b) } }
+
+    /// What WiZ ships as its dim-to-warm curve, for lamps that don't report one.
+    static let defaultWarmCurve = [[1800, 1], [1800, 10], [2700, 50], [4200, 90], [4200, 100]]
+
+    /// The white temperature a dim-to-warm curve gives at `dimming` %, clamped to what the lamp can show.
+    static func warmTemperature(at dimming: Double, curve: [[Int]]) -> Double {
+        let points = curve.compactMap { $0.count == 2 ? (kelvin: Double($0[0]), dimming: Double($0[1])) : nil }
+            .sorted { $0.dimming < $1.dimming }
+        guard let first = points.first, let last = points.last else { return 2700 }
+        var kelvin = dimming <= first.dimming ? first.kelvin : last.kelvin
+        for (a, b) in zip(points, points.dropFirst()) where dimming > a.dimming && dimming <= b.dimming {
+            let t = b.dimming == a.dimming ? 1 : (dimming - a.dimming) / (b.dimming - a.dimming)
+            kelvin = a.kelvin + (b.kelvin - a.kelvin) * t
+            break
+        }
+        return min(max(kelvin, range.lowerBound), range.upperBound)
+    }
 }

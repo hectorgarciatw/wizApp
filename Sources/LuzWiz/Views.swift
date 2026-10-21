@@ -373,6 +373,15 @@ struct FooterView: View {
                     .disabled(store.selectedLamp == nil)
                 Toggle("Abrir al iniciar sesión",
                        isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
+                Divider()
+                Section("Lámpara") {
+                    Toggle("Más cálida al bajar el brillo",
+                           isOn: Binding(get: { store.dimToWarm }, set: { store.setDimToWarm($0) }))
+                    Toggle("Encendido y apagado suaves",
+                           isOn: Binding(get: { store.softFade }, set: { store.setSoftFade($0) }))
+                    Toggle("Colores suaves con LED blanco",
+                           isOn: Binding(get: { store.softWhites }, set: { store.setSoftWhites($0) }))
+                }
                 if let lamp = store.selectedLamp {
                     Divider()
                     Text("IP: \(lamp.ip)")

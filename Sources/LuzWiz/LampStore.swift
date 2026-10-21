@@ -31,6 +31,12 @@ final class LampStore {
     var renaming = false
     var panelOpen = false
 
+    // Lamp options the app applies itself (the firmware refuses setUserConfig over the LAN).
+    private(set) var dimToWarm = UserDefaults.standard.bool(forKey: "dimToWarm")
+    private(set) var softFade = UserDefaults.standard.bool(forKey: "softFade")
+    private(set) var softWhites = UserDefaults.standard.bool(forKey: "softWhites")
+
+    @ObservationIgnored private var rampTask: Task<Void, Never>?
     @ObservationIgnored private var pending: [String: Any] = [:]
     @ObservationIgnored private var sending = false
     @ObservationIgnored private var lastInteraction = Date.distantPast
@@ -124,7 +130,9 @@ final class LampStore {
         reachable = true
         failures = 0
         // The first lookup can fail while macOS is still asking for local network access.
-        if lamp.firmware == nil { await addOrUpdate(mac: lamp.id, ip: lamp.ip) }
+        if lamp.firmware == nil || lamp.warmCurve == nil { await addOrUpdate(mac: lamp.id, ip: lamp.ip) }
+        // Mid-fade the app's own picture of the light is the right one.
+        if rampTask != nil { return }
         if !force && (sending || Date().timeIntervalSince(lastInteraction) < 2.5) { return }
         apply(Pilot(reply))
     }
@@ -166,6 +174,10 @@ final class LampStore {
             lamps[index].firmware = config["fwVersion"] as? String
             lamps[index].module = config["moduleName"] as? String
         }
+        if let index = lamps.firstIndex(where: { $0.id == mac }), lamps[index].warmCurve == nil,
+           let config = Wiz.result(await Wiz.send(Wiz.message("getUserConfig"), to: ip)) {
+            lamps[index].warmCurve = config["dim2WarmPoints"] as? [[Int]] ?? WhiteLight.defaultWarmCurve
+        }
         saveLamps()
     }
 
@@ -199,7 +211,14 @@ final class LampStore {
         if let value = pilot.rssi { rssi = value }
         if let rgb = pilot.rgb, pilot.sceneId == 0 {
             mode = .color
-            (hue, saturation) = rgb.hueSaturation
+            let white = max(pilot.cool, pilot.warm)
+            if white > 0 {
+                // A soft colour: full-strength hue scaled down, the rest made up by a white LED.
+                if rgb.r + rgb.g + rgb.b > 0 { hue = rgb.hueSaturation.hue }
+                saturation = 1 - Double(white) / 255
+            } else {
+                (hue, saturation) = rgb.hueSaturation
+            }
         } else if pilot.sceneId != 0 {
             mode = .scenes
             sceneId = pilot.sceneId
@@ -213,30 +232,98 @@ final class LampStore {
     // MARK: - Controls
 
     func setPower(_ on: Bool) {
-        isOn = on
-        send(["state": on])
+        cancelRamp()
+        guard softFade else {
+            isOn = on
+            send(["state": on])
+            return
+        }
+        let target = Int(brightness)
+        if on {
+            isOn = true
+            send(["state": true, "dimming": 10])
+            rampTask = Task { [weak self] in
+                await self?.rampDimming(from: 10, to: target)
+                if !Task.isCancelled { self?.rampTask = nil }
+            }
+        } else {
+            rampTask = Task { [weak self] in
+                await self?.rampDimming(from: target, to: 10)
+                guard let self, !Task.isCancelled else { return }
+                // Turning off with the old dimming makes the lamp come back at it, not at 10 %.
+                isOn = false
+                send(["state": false, "dimming": target])
+                rampTask = nil
+            }
+        }
+    }
+
+    /// Steps the dimming over 1.5 s for a soft on/off; `brightness` keeps the level to return to.
+    private func rampDimming(from start: Int, to end: Int) async {
+        let steps = 15
+        for step in 1...steps {
+            if Task.isCancelled { return }
+            send(["dimming": start + (end - start) * step / steps])
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    private func cancelRamp() {
+        rampTask?.cancel()
+        rampTask = nil
     }
 
     func setBrightness(_ value: Double) {
         brightness = min(max(value.rounded(), 10), 100)
-        send(["dimming": Int(brightness)])
+        cancelRamp()
+        if dimToWarm && mode == .white {
+            temperature = WhiteLight.warmTemperature(at: brightness, curve: warmCurve)
+            send(["temp": Int(temperature), "dimming": Int(brightness)])
+        } else {
+            send(["dimming": Int(brightness)])
+        }
     }
 
+    private var warmCurve: [[Int]] { selectedLamp?.warmCurve ?? WhiteLight.defaultWarmCurve }
+
     func setTemperature(_ kelvin: Double) {
+        cancelRamp()
         temperature = min(max((kelvin / 50).rounded() * 50, WhiteLight.range.lowerBound), WhiteLight.range.upperBound)
         mode = .white
         send(["temp": Int(temperature), "dimming": Int(brightness)])
     }
 
     func setColor(hue: Double, saturation: Double) {
+        cancelRamp()
         self.hue = min(max(hue, 0), 1)
         self.saturation = min(max(saturation, 0), 1)
         mode = .color
-        let rgb = RGB(hue: self.hue, saturation: self.saturation)
-        send(["r": rgb.r, "g": rgb.g, "b": rgb.b, "dimming": Int(brightness)])
+        send(colorParams())
+    }
+
+    /// setPilot parameters for the current hue and saturation. With soft whites, the pale part of a
+    /// colour comes from the warm (or, for blues and greens, the cool) white LED instead of mixed RGB.
+    private func colorParams() -> [String: Int] {
+        var params = ["dimming": Int(brightness)]
+        if softWhites {
+            let pure = RGB(hue: hue, saturation: 1)
+            params["r"] = Int(Double(pure.r) * saturation)
+            params["g"] = Int(Double(pure.g) * saturation)
+            params["b"] = Int(Double(pure.b) * saturation)
+            let coolHue = (0.42...0.75).contains(hue)
+            params[coolHue ? "c" : "w"] = Int((1 - saturation) * 255)
+            params[coolHue ? "w" : "c"] = 0
+        } else {
+            let rgb = RGB(hue: hue, saturation: saturation)
+            params["r"] = rgb.r
+            params["g"] = rgb.g
+            params["b"] = rgb.b
+        }
+        return params
     }
 
     func pickScene(_ id: Int) {
+        cancelRamp()
         sceneId = id
         mode = .scenes
         var params: [String: Any] = ["sceneId": id, "dimming": Int(brightness)]
@@ -263,10 +350,10 @@ final class LampStore {
     private func send(_ params: [String: Any]) {
         lastInteraction = Date()
         // Only one of white, colour or scene can be active; drop queued keys of the others.
-        if params["temp"] != nil { ["r", "g", "b", "sceneId", "speed"].forEach { pending[$0] = nil } }
-        if params["r"] != nil { ["temp", "sceneId", "speed"].forEach { pending[$0] = nil } }
+        if params["temp"] != nil { ["r", "g", "b", "c", "w", "sceneId", "speed"].forEach { pending[$0] = nil } }
+        if params["r"] != nil { ["temp", "c", "w", "sceneId", "speed"].forEach { pending[$0] = nil } }
         if params["sceneId"] != nil {
-            ["temp", "r", "g", "b"].forEach { pending[$0] = nil }
+            ["temp", "r", "g", "b", "c", "w"].forEach { pending[$0] = nil }
             if params["speed"] == nil { pending["speed"] = nil }
         }
         pending.merge(params) { $1 }
@@ -303,10 +390,7 @@ final class LampStore {
             params["temp"] = Int(temperature)
             name = "Blanco \(Int(temperature)) K"
         case .color:
-            let rgb = RGB(hue: hue, saturation: saturation)
-            params["r"] = rgb.r
-            params["g"] = rgb.g
-            params["b"] = rgb.b
+            params = colorParams()
             name = "Color"
         case .scenes:
             params["sceneId"] = sceneId
@@ -318,6 +402,7 @@ final class LampStore {
     }
 
     func applyFavorite(_ favorite: Favorite) {
+        cancelRamp()
         var result: [String: Any] = favorite.params
         result["state"] = true
         apply(Pilot(result))
@@ -331,7 +416,12 @@ final class LampStore {
 
     func color(for favorite: Favorite) -> Color {
         let p = favorite.params
-        if let r = p["r"], let g = p["g"], let b = p["b"] { return RGB(r: r, g: g, b: b).color }
+        if let r = p["r"], let g = p["g"], let b = p["b"] {
+            let white = max(p["c"] ?? 0, p["w"] ?? 0)
+            guard white > 0 else { return RGB(r: r, g: g, b: b).color }
+            let hue = r + g + b > 0 ? RGB(r: r, g: g, b: b).hueSaturation.hue : 0
+            return RGB(hue: hue, saturation: 1 - Double(white) / 255).color
+        }
         if let id = p["sceneId"] { return Scenes.scene(id)?.tint ?? .yellow }
         return WhiteLight.color(Double(p["temp"] ?? 2700))
     }
@@ -366,5 +456,24 @@ final class LampStore {
             NSLog("Luz WiZ: could not change login item: \(error)")
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
+    // MARK: - Lamp options
+
+    func setDimToWarm(_ enabled: Bool) {
+        dimToWarm = enabled
+        UserDefaults.standard.set(enabled, forKey: "dimToWarm")
+        if enabled && mode == .white { setBrightness(brightness) }
+    }
+
+    func setSoftFade(_ enabled: Bool) {
+        softFade = enabled
+        UserDefaults.standard.set(enabled, forKey: "softFade")
+    }
+
+    func setSoftWhites(_ enabled: Bool) {
+        softWhites = enabled
+        UserDefaults.standard.set(enabled, forKey: "softWhites")
+        if mode == .color { setColor(hue: hue, saturation: saturation) }
     }
 }
